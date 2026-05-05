@@ -2,95 +2,72 @@ pipeline {
     agent any
     
     environment {
-        DOCKER_HUB_REPO = 'kmithesh'
-        DOCKER_CREDENTIALS_ID = 'dockerhub-credentials'
+        DOCKER_HUB_CREDENTIALS = credentials('dockerhub-credentials')
+        DOCKER_HUB_USERNAME = 'kmithesh'
         GIT_MANIFEST_REPO = 'https://github.com/MitheshChandra/microservices-k8s-manifests.git'
         GIT_CREDENTIALS_ID = 'github-credentials'
-        ARGOCD_SERVER = credentials('argocd-server')
-        ARGOCD_AUTH_TOKEN = credentials('argocd-auth-token')
-    }
-    
-    parameters {
-        choice(name: 'DEPLOY_ENV', choices: ['dev', 'prod'], description: 'Target deployment environment')
-        choice(name: 'SERVICE', choices: ['all', 'api-gateway', 'user-service', 'order-service', 'payment-service'], description: 'Service to build and deploy')
+        ARGOCD_SERVER = '44.220.144.81:32438'  
+        IMAGE_TAG = "${BUILD_NUMBER}"
+        SERVICES = 'api-gateway,user-service,order-service,payment-service'
     }
     
     stages {
         stage('Checkout Code') {
             steps {
-                script {
-                    echo "Checking out source code..."
-                    checkout scm
-                    env.GIT_COMMIT_SHORT = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
-                    env.BUILD_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}"
-                    echo "Build tag: ${env.BUILD_TAG}"
-                }
+                echo 'Checking out source code...'
+                checkout scm
             }
         }
         
         stage('Install Dependencies') {
             steps {
-                script {
-                    echo "Installing Python dependencies..."
-                    sh '''
-                        python3 -m venv venv
-                        . venv/bin/activate
-                        pip install --upgrade pip
-                        pip install -r requirements-dev.txt
-                    '''
+                echo 'Installing Python dependencies...'
+                sh '''
+                    python3 -m venv venv
+                    . venv/bin/activate
+                    pip install --upgrade pip
+                    pip install -r requirements-dev.txt
+                    pip install -r api-gateway/requirements.txt
+                    pip install -r payment-service/requirements.txt
+                '''
+            }
+        }
+        
+        stage('Run Unit Tests') {
+            steps {
+                echo 'Running unit tests with pytest...'
+                sh '''
+                    . venv/bin/activate
+                    pytest --verbose --junit-xml=test-results.xml
+                '''
+            }
+            post {
+                always {
+                    junit 'test-results.xml'
                 }
             }
         }
         
         stage('Code Quality Check') {
             steps {
-                script {
-                    echo "Running Flake8 code quality checks..."
-                    sh '''
-                        . venv/bin/activate
-                        flake8 . --count --show-source --statistics || true
-                    '''
-                }
-            }
-        }
-        
-        stage('Unit Tests') {
-            steps {
-                script {
-                    echo "Running unit tests..."
-                    sh '''
-                        . venv/bin/activate
-                        pip install -r api-gateway/requirements.txt
-                        pip install -r payment-service/requirements.txt
-                        pytest tests/ -v --junitxml=test-results.xml --cov=. --cov-report=xml --cov-report=html
-                    '''
-                }
-            }
-            post {
-                always {
-                    junit 'test-results.xml'
-                    publishHTML(target: [
-                        reportDir: 'htmlcov',
-                        reportFiles: 'index.html',
-                        reportName: 'Coverage Report'
-                    ])
-                }
+                echo 'Running flake8 code quality checks...'
+                sh '''
+                    . venv/bin/activate
+                    flake8 . --count --statistics
+                '''
             }
         }
         
         stage('Build Docker Images') {
             steps {
+                echo 'Building Docker images for all microservices...'
                 script {
-                    def services = params.SERVICE == 'all' ? 
-                        ['api-gateway', 'user-service', 'order-service', 'payment-service'] : 
-                        [params.SERVICE]
-                    
+                    def services = env.SERVICES.split(',')
                     services.each { service ->
-                        echo "Building Docker image for ${service}..."
                         sh """
-                            cd ${service}
-                            docker build -t ${DOCKER_HUB_REPO}/${service}:${BUILD_TAG} .
-                            docker tag ${DOCKER_HUB_REPO}/${service}:${BUILD_TAG} ${DOCKER_HUB_REPO}/${service}:latest
+                            docker build -t ${DOCKER_HUB_USERNAME}/${service}:${IMAGE_TAG} \
+                                         -t ${DOCKER_HUB_USERNAME}/${service}:latest \
+                                         ./${service}/
                         """
                     }
                 }
@@ -99,15 +76,14 @@ pipeline {
         
         stage('Security Scan with Trivy') {
             steps {
+                echo 'Scanning Docker images for vulnerabilities...'
                 script {
-                    def services = params.SERVICE == 'all' ? 
-                        ['api-gateway', 'user-service', 'order-service', 'payment-service'] : 
-                        [params.SERVICE]
-                    
+                    def services = env.SERVICES.split(',')
                     services.each { service ->
-                        echo "Scanning ${service} for vulnerabilities..."
                         sh """
-                            trivy image --severity HIGH,CRITICAL --exit-code 0 ${DOCKER_HUB_REPO}/${service}:${BUILD_TAG}
+                            trivy image --severity HIGH,CRITICAL \
+                                --exit-code 0 \
+                                ${DOCKER_HUB_USERNAME}/${service}:${IMAGE_TAG}
                         """
                     }
                 }
@@ -116,19 +92,18 @@ pipeline {
         
         stage('Push to Docker Hub') {
             steps {
+                echo 'Pushing Docker images to Docker Hub...'
                 script {
-                    def services = params.SERVICE == 'all' ? 
-                        ['api-gateway', 'user-service', 'order-service', 'payment-service'] : 
-                        [params.SERVICE]
+                    sh """
+                        echo ${DOCKER_HUB_CREDENTIALS_PSW} | docker login -u ${DOCKER_HUB_CREDENTIALS_USR} --password-stdin
+                    """
                     
-                    docker.withRegistry('https://index.docker.io/v1/', "${DOCKER_CREDENTIALS_ID}") {
-                        services.each { service ->
-                            echo "Pushing ${service} to Docker Hub..."
-                            sh """
-                                docker push ${DOCKER_HUB_REPO}/${service}:${BUILD_TAG}
-                                docker push ${DOCKER_HUB_REPO}/${service}:latest
-                            """
-                        }
+                    def services = env.SERVICES.split(',')
+                    services.each { service ->
+                        sh """
+                            docker push ${DOCKER_HUB_USERNAME}/${service}:${IMAGE_TAG}
+                            docker push ${DOCKER_HUB_USERNAME}/${service}:latest
+                        """
                     }
                 }
             }
@@ -136,85 +111,107 @@ pipeline {
         
         stage('Update Kubernetes Manifests') {
             steps {
+                echo 'Updating Kubernetes manifests with new image tags...'
                 script {
-                    def services = params.SERVICE == 'all' ? 
-                        ['api-gateway', 'user-service', 'order-service', 'payment-service'] : 
-                        [params.SERVICE]
-                    
-                    echo "Cloning manifest repository..."
-                    
                     withCredentials([usernamePassword(credentialsId: "${GIT_CREDENTIALS_ID}", 
-                                                      usernameVariable: 'GIT_USERNAME', 
-                                                      passwordVariable: 'GIT_PASSWORD')]) {
-                        sh '''
-                            rm -rf microservices-k8s-manifests
-                            git clone https://${GIT_USERNAME}:${GIT_PASSWORD}@github.com/MitheshChandra/microservices-k8s-manifests.git
-                            cd microservices-k8s-manifests
-                            git config user.email "jenkins@ci.com"
+                                                       usernameVariable: 'GIT_USERNAME', 
+                                                       passwordVariable: 'GIT_PASSWORD')]) {
+                        sh """
+                            rm -rf k8s-manifests-temp
+                            git clone https://${GIT_USERNAME}:${GIT_PASSWORD}@github.com/MitheshChandra/microservices-k8s-manifests.git k8s-manifests-temp
+                            cd k8s-manifests-temp
+                            
+                            # Update dev environment
+                            sed -i 's|image: ${DOCKER_HUB_USERNAME}/api-gateway:.*|image: ${DOCKER_HUB_USERNAME}/api-gateway:${IMAGE_TAG}|g' Dev/api-gateway.yaml
+                            sed -i 's|image: ${DOCKER_HUB_USERNAME}/user-service:.*|image: ${DOCKER_HUB_USERNAME}/user-service:${IMAGE_TAG}|g' Dev/user-service.yaml
+                            sed -i 's|image: ${DOCKER_HUB_USERNAME}/order-service:.*|image: ${DOCKER_HUB_USERNAME}/order-service:${IMAGE_TAG}|g' Dev/order-service.yaml
+                            sed -i 's|image: ${DOCKER_HUB_USERNAME}/payment-service:.*|image: ${DOCKER_HUB_USERNAME}/payment-service:${IMAGE_TAG}|g' Dev/payment-service.yaml
+                            
+                            git config user.email "jenkins@cicd.local"
                             git config user.name "Jenkins CI"
-                        '''
-                        
-                        services.each { service ->
-                            echo "Updating ${service} manifest for ${params.DEPLOY_ENV} environment..."
-                            sh """
-                                cd microservices-k8s-manifests/${params.DEPLOY_ENV}
-                                sed -i 's|image: ${DOCKER_HUB_REPO}/${service}:.*|image: ${DOCKER_HUB_REPO}/${service}:${BUILD_TAG}|' ${service}.yaml
-                            """
-                        }
-                        
-                        sh '''
-                            cd microservices-k8s-manifests
                             git add .
-                            git commit -m "Jenkins CI: Update image tags to ${BUILD_TAG} for ${DEPLOY_ENV}" || echo "No changes to commit"
+                            git commit -m "Jenkins Build ${BUILD_NUMBER}: Update dev images to tag ${IMAGE_TAG}" || true
                             git push https://${GIT_USERNAME}:${GIT_PASSWORD}@github.com/MitheshChandra/microservices-k8s-manifests.git main
-                        '''
+                            
+                            cd ..
+                            rm -rf k8s-manifests-temp
+                        """
                     }
                 }
             }
         }
         
-        stage('Deploy to Dev (Auto)') {
-            when {
-                expression { params.DEPLOY_ENV == 'dev' }
-            }
+        stage('Deploy to DEV (Auto)') {
             steps {
+                echo 'Triggering Argo CD sync for DEV environment...'
                 script {
-                    echo "Auto-deploying to Dev environment via Argo CD..."
-                    sh """
-                        argocd login ${ARGOCD_SERVER} --auth-token ${ARGOCD_AUTH_TOKEN} --insecure
-                        argocd app sync microservices-dev --force
-                        argocd app wait microservices-dev --timeout 300
-                    """
+                    withCredentials([usernamePassword(credentialsId: 'argocd-credentials', 
+                                                       usernameVariable: 'ARGOCD_USERNAME', 
+                                                       passwordVariable: 'ARGOCD_PASSWORD')]) {
+                        sh """
+                            argocd login ${ARGOCD_SERVER} --insecure --username ${ARGOCD_USERNAME} --password ${ARGOCD_PASSWORD}
+                            argocd app sync microservices-dev --force
+                            argocd app wait microservices-dev --timeout 300
+                        """
+                    }
                 }
             }
         }
         
-        stage('Approval for Prod') {
-            when {
-                expression { params.DEPLOY_ENV == 'prod' }
-            }
+        stage('Approval for PROD') {
             steps {
+                echo 'Waiting for manual approval to deploy to PROD...'
+                input message: 'Deploy to Production?', 
+                      ok: 'Deploy', 
+                      submitter: 'devops-manager,sde-manager'
+            }
+        }
+        
+        stage('Update PROD Manifests') {
+            steps {
+                echo 'Updating PROD Kubernetes manifests...'
                 script {
-                    echo "Waiting for manual approval to deploy to Production..."
-                    input message: 'Deploy to Production?', 
-                          ok: 'Deploy',
-                          submitter: 'devops-manager,sde-manager'
+                    withCredentials([usernamePassword(credentialsId: "${GIT_CREDENTIALS_ID}", 
+                                                       usernameVariable: 'GIT_USERNAME', 
+                                                       passwordVariable: 'GIT_PASSWORD')]) {
+                        sh """
+                            rm -rf k8s-manifests-temp
+                            git clone https://${GIT_USERNAME}:${GIT_PASSWORD}@github.com/MitheshChandra/microservices-k8s-manifests.git k8s-manifests-temp
+                            cd k8s-manifests-temp
+                            
+                            # Update prod environment
+                            sed -i 's|image: ${DOCKER_HUB_USERNAME}/api-gateway:.*|image: ${DOCKER_HUB_USERNAME}/api-gateway:${IMAGE_TAG}|g' Prod/api-gateway.yaml
+                            sed -i 's|image: ${DOCKER_HUB_USERNAME}/user-service:.*|image: ${DOCKER_HUB_USERNAME}/user-service:${IMAGE_TAG}|g' Prod/user-service.yaml
+                            sed -i 's|image: ${DOCKER_HUB_USERNAME}/order-service:.*|image: ${DOCKER_HUB_USERNAME}/order-service:${IMAGE_TAG}|g' Prod/order-service.yaml
+                            sed -i 's|image: ${DOCKER_HUB_USERNAME}/payment-service:.*|image: ${DOCKER_HUB_USERNAME}/payment-service:${IMAGE_TAG}|g' Prod/payment-service.yaml
+                            
+                            git config user.email "jenkins@cicd.local"
+                            git config user.name "Jenkins CI"
+                            git add .
+                            git commit -m "Jenkins Build ${BUILD_NUMBER}: Update prod images to tag ${IMAGE_TAG}" || true
+                            git push https://${GIT_USERNAME}:${GIT_PASSWORD}@github.com/MitheshChandra/microservices-k8s-manifests.git main
+                            
+                            cd ..
+                            rm -rf k8s-manifests-temp
+                        """
+                    }
                 }
             }
         }
         
-        stage('Deploy to Prod (Manual)') {
-            when {
-                expression { params.DEPLOY_ENV == 'prod' }
-            }
+        stage('Deploy to PROD (Manual)') {
             steps {
+                echo 'Triggering Argo CD sync for PROD environment...'
                 script {
-                    echo "Deploying to Production environment via Argo CD..."
-                    sh """
-                        argocd login ${ARGOCD_SERVER} --auth-token ${ARGOCD_AUTH_TOKEN} --insecure
-                        argocd app sync microservices-prod --force
-                        argocd app wait microservices-prod --timeout 300
-                    """
+                    withCredentials([usernamePassword(credentialsId: 'argocd-credentials', 
+                                                       usernameVariable: 'ARGOCD_USERNAME', 
+                                                       passwordVariable: 'ARGOCD_PASSWORD')]) {
+                        sh """
+                            argocd login ${ARGOCD_SERVER} --insecure --username ${ARGOCD_USERNAME} --password ${ARGOCD_PASSWORD}
+                            argocd app sync microservices-prod --force
+                            argocd app wait microservices-prod --timeout 300
+                        """
+                    }
                 }
             }
         }
@@ -222,13 +219,14 @@ pipeline {
     
     post {
         success {
-            echo "Pipeline completed successfully!"
-            echo "Services deployed to ${params.DEPLOY_ENV} environment"
+            echo 'Pipeline completed successfully!'
         }
         failure {
-            echo "Pipeline failed. Check logs for details."
+            echo 'Pipeline failed. Check logs for details.'
         }
         always {
+            echo 'Cleaning up...'
+            sh 'docker system prune -f || true'
             cleanWs()
         }
     }
